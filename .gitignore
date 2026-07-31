@@ -1,0 +1,14 @@
+# AWS credentials — never commit these
+*accessKeys*.csv
+*.pem
+.aws/
+
+# Local data / large files
+*.parquet
+raw-data/
+
+# OS / editor junk
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
