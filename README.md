@@ -17,6 +17,14 @@ NYC TLC (CloudFront) → S3 (raw) → EMR Serverless (PySpark) → S3 (partition
 - **Cataloging:** AWS Glue Crawler auto-infers schema and registers the output as a queryable table
 - **Query layer:** Amazon Athena, run directly against the partitioned output
 
+### Why EMR Serverless + Glue/Athena over a persistent Airflow-orchestrated setup
+This was a solo, weekend-scoped batch job with no recurring schedule requirement,
+so I optimized for zero ops overhead: EMR Serverless removes cluster sizing/idle-cost
+decisions, and Glue Crawler + Athena gives a queryable output with no separate
+orchestration layer to maintain. For a recurring production pipeline I'd add Airflow
+for scheduling/retries and consider Delta Lake if downstream consumers needed ACID
+guarantees on incremental updates.
+
 ## What the pipeline does
 
 1. **Ingest** — pulls monthly NYC yellow taxi trip records (Parquet) from NYC TLC's public distribution
