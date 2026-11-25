@@ -1,8 +1,12 @@
-# NYC TLC Trip Data Pipeline — EMR Serverless + PySpark
+# NYC TLC Trip Data Pipeline: EMR Serverless + PySpark + Claude
 
-A batch data pipeline built solo over a weekend to process NYC Taxi & Limousine Commission (TLC) trip data using AWS EMR Serverless and PySpark, with results cataloged in AWS Glue and queried via Amazon Athena plus a natural-language query layer and LLM-assisted data quality triage built on top.
+A batch data pipeline built solo to process NYC Taxi & Limousine Commission (TLC) trip data with AWS EMR Serverless and PySpark. Results are cataloged in AWS Glue and queried through Amazon Athena. A Claude-powered AI layer on top adds natural-language querying and anomaly triage.
+
+![Architecture](docs/architecture.png)
 
 ## Architecture
+
+**Core pipeline**
 
 ```
 NYC TLC (CloudFront) → S3 (raw) → EMR Serverless (PySpark) → S3 (partitioned Parquet)
@@ -10,24 +14,27 @@ NYC TLC (CloudFront) → S3 (raw) → EMR Serverless (PySpark) → S3 (partition
                                                               AWS Glue Crawler
                                                                       ↓
                                                               Amazon Athena (SQL)
-                                                                      ↓
-                                                    Claude (nl_to_sql.py / streamlit_app.py)
 ```
 
-- **Compute:** EMR Serverless — chosen over a persistent cluster to avoid idle compute cost; billed per-second with no capacity planning required for this workload
-- **Storage:** Amazon S3, output written as Parquet partitioned by `pickup_date`
-- **Cataloging:** AWS Glue Crawler auto-infers schema and registers the output as a queryable table
-- **Query layer:** Amazon Athena, run directly against the partitioned output
-- **AI layer:** Claude (Anthropic API) for natural-language querying and anomaly triage, see [AI Layer](#ai-layer) below
+- **Compute:** EMR Serverless, chosen over a persistent cluster because it bills per second and needs no cluster sizing. This is a batch job with no recurring schedule, so idle cost would be pure waste.
+- **Storage:** Amazon S3, with output written as Parquet partitioned by `pickup_date`.
+- **Catalog:** AWS Glue Crawler infers the schema and registers the output as a table.
+- **Query:** Amazon Athena runs directly against the partitioned output.
+- **Why not Airflow or Delta Lake:** there is no recurring schedule and no update/merge workload, so Glue + Athena is the simpler fit.
+
+**AI layer** (runs locally against the AWS resources above)
+
+- `nl_to_sql.py` and `streamlit_app.py`: ask a question in English, Claude writes Athena SQL, a code-level check enforces a read-only SELECT, then Athena runs it.
+- `day3_anomaly_triage.py`: a statistical pre-filter flags suspicious aggregate rows, and Claude classifies only that small subset.
 
 ## What the pipeline does
 
-1. **Ingest** — pulls monthly NYC yellow taxi trip records (Parquet) from NYC TLC's public distribution
-2. **Schema handling** — merges schema across files and standardizes column names, since TLC's schema and naming conventions have drifted across years (e.g. a `cbd_congestion_fee` column added in Jan 2025)
-3. **Cleaning** — filters out malformed records: non-positive/absurd trip durations, negative distance or fare values
-4. **Feature engineering** — computes trip duration, average speed, and a basic speed-based anomaly flag
-5. **Aggregation** — groups by pickup date, hour, and pickup zone
-6. **Output** — writes partitioned Parquet, designed so downstream queries only scan relevant date partitions
+1. **Ingest:** pulls monthly NYC yellow taxi trip records (Parquet) from TLC's public distribution.
+2. **Schema handling:** merges schema across files and standardizes column names, since TLC's schema has drifted across years (for example, a `cbd_congestion_fee` column added in Jan 2025).
+3. **Cleaning:** filters malformed records, such as non-positive or absurd trip durations and negative distance or fare values.
+4. **Feature engineering:** computes trip duration, average speed, and a basic speed-based anomaly flag.
+5. **Aggregation:** groups by pickup date, hour, and pickup zone.
+6. **Output:** writes partitioned Parquet so downstream queries scan only the relevant date partitions.
 
 ## Results
 
@@ -41,96 +48,85 @@ Run against 3 months of data (Jan–Mar 2024):
 | Output partitions | 97 (by `pickup_date`) |
 | Sample Athena query runtime | 1.378 sec, 5.76 MB scanned |
 
-The low data-scan volume on the sample query confirms the date-partitioning strategy works as intended — queries don't need to scan the full dataset.
+The small scan volume on the sample query confirms the date-partitioning strategy works as intended.
+
+## AI layer
+
+### Natural-language querying
+
+Querying the table normally requires knowing SQL and the exact schema. Here you ask a plain-English question and Claude generates the Athena SQL from the table's real schema. The query is checked in code before it touches Athena, and questions the schema cannot answer return `NOT_ANSWERABLE`.
+
+| Question | Outcome |
+|---|---|
+| Total trip count for `pickup_hour` 8 | 367,298 |
+| Average fare amount on 2024-01-15 | about $25.23 |
+| "Delete all records where `anomalous_trip_count` > 0" | Refused. No query executed. |
+
+The refusal is not left to the model. `is_safe_select` independently verifies that the statement is a single read-only SELECT before anything runs.
+
+### Anomaly triage
+
+This closes the known limitation below. `day2_aggregates` holds pre-aggregated rows (per date, hour, and pickup zone), so triage works on aggregate rows rather than individual trips.
+
+1. A cheap statistical pre-filter flags rows with out-of-range dates, fare or duration outliers (outside p01/p99), or a high share of already-anomalous trips.
+2. Only that subset goes to Claude, which classifies each row as `likely_data_entry_error`, `legitimate_edge_case`, or `needs_manual_review`, with a one-sentence reason.
+
+On a random sample of 50 flagged rows (out of 240,649 flagged), the split was 23 legitimate edge cases, 22 likely data-entry errors, and 5 needing manual review. Run directly on the two known-bad partitions, `2002-12-31` (2 rows) and `2008-12-31` (1 row) were all classified `likely_data_entry_error`.
+
+Triage is a **detection** layer. It surfaces and explains bad rows but does not prevent them from being written. Date-range validation inside `day2_transform.py` would be the preventive fix.
 
 ## Real issues hit & resolved
 
-- **Broken documented data source:** the commonly-referenced `s3://nyc-tlc` public bucket path returns `AccessDenied` (has been inaccessible since ~2022 despite still being referenced as canonical). Resolved by sourcing from NYC TLC's actual current CloudFront distribution instead.
-- **Spark ANSI-mode cast failure:** a direct `TIMESTAMP → BIGINT` cast (previously valid) fails under Spark's ANSI SQL mode, the default from Spark 4.x onward. Resolved using `unix_timestamp()` instead of an implicit cast.
+1. **Broken documented data source:** the commonly referenced `s3://nyc-tlc` bucket returns `AccessDenied` (inaccessible since about 2022). Sourced from TLC's current CloudFront distribution instead.
+2. **Spark ANSI-mode cast failure:** a direct `TIMESTAMP → BIGINT` cast fails under Spark's ANSI mode, the default from Spark 4.x. Fixed with `unix_timestamp()`.
+3. **Athena `TYPE_MISMATCH` (varchar = date):** Glue inferred `pickup_date` as a string, so `DATE '2024-01-15'` comparisons failed. Fixed by describing the column as a `'YYYY-MM-DD'` string in the model's schema prompt.
+4. **Categorical dtype:** pandas/pyarrow read Hive partition columns as `Categorical`, which cannot be compared with `<` / `>`. Fixed by casting to string before parsing dates.
+5. **`row_id` merge error:** the model's JSON returned numeric IDs as ints while the dataframe used strings. Fixed by casting both sides to string before merging.
+6. **Partition column lost:** reading a single `pickup_date=...` folder drops the partition column, because pyarrow only reconstructs it from a dataset root. Fixed by recovering the date from the `--input` path.
+7. **Missing IAM permission:** `glue:GetPartitions` was needed for Athena to resolve partitions. Added to the policy.
 
 ## Known limitation
 
-A handful of output partitions contain clearly invalid pickup dates (e.g. years 2002, 2008) that pass the duration/fare validation because those checks validate the trip itself, not the calendar date. Explicit date-range validation would be the next improvement to the core Spark job.
+A handful of output partitions contain clearly invalid pickup dates (for example years 2002 and 2008). They pass duration and fare validation because those checks validate the trip, not the calendar date. The anomaly triage step now detects and explains them. Rejecting them at write time is still the next improvement.
 
-**Update:** this gap is now caught by a secondary LLM-based triage pass rather than the original Spark validation — see [AI Layer](#ai-layer) below. The underlying pipeline still doesn't filter these at write time; the triage script is a detection layer on top, not a fix to `day2_transform.py` itself. Baking the check into the Spark job directly would be the cleaner long-term fix.
+## Productionizing
 
-## AI Layer
+The AI scripts run locally by design, to keep this build scoped. The path to running them in AWS:
 
-The core pipeline produces a queryable table, but querying it still requires knowing SQL and the exact schema. This layer adds three small, focused pieces on top of that output, each one solves a specific gap rather than being AI added for its own sake.
-
-### 1. Natural-language querying (`nl_to_sql.py`, `streamlit_app.py`)
-
-Translates a plain-English question into Athena SQL, runs it, and returns the result. Scoped deliberately narrow: one known table, one schema passed explicitly to the model, and a hard safety check before anything executes.
-
-**Design choices:**
-- The model is given the exact `day2_aggregates` schema up front rather than being allowed to guess column names. This is what makes the generated SQL reliable instead of a coin flip.
-- Every generated query is checked to confirm it's a single read-only `SELECT` before it's allowed to run. This isn't just a prompt instruction, it's enforced in code as a second layer, independent of what the model decides to generate.
-- Ambiguous or out-of-scope questions return `NOT_ANSWERABLE` rather than a best-effort guess.
-
-**Example queries (all run against the live table):**
-
-| Question | Generated SQL | Result |
-|---|---|---|
-| "What was the total trip count for pickup_hour 8?" | `SELECT SUM(trip_count) AS total_trip_count FROM day2_aggregates WHERE pickup_hour = 8 LIMIT 1` | `367298` |
-| "What was the average fare amount on 2024-01-15?" | `SELECT AVG(avg_fare_amount) AS overall_avg_fare_amount FROM day2_aggregates WHERE pickup_date = '2024-01-15' LIMIT 1` | `$25.23` |
-| "Delete all records where anomalous_trip_count is greater than 0" | *(refused)* | `NOT_ANSWERABLE` — no query executed |
-
-That last row is the important one: the model correctly identified a destructive request as out of scope for a read-only interface and declined, rather than generating a `DELETE` statement that the safety check would then have had to catch.
-
-A minimal Streamlit UI (`streamlit_app.py`) wraps the same `ask()` function with a browser interface — text box in, generated SQL and results rendered out. No logic is duplicated between the CLI and the UI.
-
-### 2. Anomaly triage (`day3_anomaly_triage.py`)
-
-Closes the gap described in [Known limitation](#known-limitation) above: `day2_transform.py` validates trip-level fields (duration, fare) but not calendar sanity, so a handful of aggregate rows with clearly invalid pickup dates pass through undetected.
-
-This script adds a second pass:
-1. **Statistical pre-filter** (cheap, no LLM calls) — flags rows with out-of-range dates, fare/duration outliers, or a high share of already-anomalous trips within the bucket.
-2. **LLM triage** on only the flagged subset — classifies each as `likely_data_entry_error`, `legitimate_edge_case`, or `needs_manual_review`, with a one-sentence reason grounded in that row's actual values.
-
-**Confirmed working on the exact rows it was built for** — pointing the script directly at the `pickup_date=2002-12-31` and `pickup_date=2008-12-31` partitions:
-
-```
-pickup_date=2002-12-31 → likely_data_entry_error
-"pickup_date of 2002-12-31 is well outside the valid TLC data range
-(2009-present), making this almost certainly a data entry or system error
-regardless of the otherwise plausible fare and duration values."
-
-pickup_date=2008-12-31 → likely_data_entry_error
-"The pickup_date of 2008-12-31 predates the TLC public dataset's valid
-range (which begins in 2009), indicating a likely data entry or system
-error despite the otherwise plausible fare and duration values."
-```
-
-Both classifications correctly separate the *date* signal from the *fare/duration* signal instead of just pattern-matching on "this row looks weird" the model explicitly notes the other values were plausible and the date alone was disqualifying.
-
-### AI layer bugs hit & resolved
-
-Documented here rather than smoothed over, in the same spirit as the [Real issues](#real-issues-hit--resolved) section above:
-
-- **`TYPE_MISMATCH: varchar = date`** — the Glue Crawler inferred `pickup_date` as a string, not a `DATE` type. Fixed by giving the model explicit type information in the schema description instead of assuming Athena's native date type.
-- **Missing `glue:GetPartitions` permission** — Athena needs this to read partition metadata on a partitioned table; it's easy to grant `GetTable`/`GetDatabase` and miss this one until a partitioned-column query actually runs.
-- **Unordered Categorical comparison error** — pandas/pyarrow reads Hive-partitioned columns (`pickup_date=.../`) back as `Categorical` dtype, which can't be compared with `<`/`>` directly. Fixed by casting to string before parsing as a date.
-- **`row_id` merge type mismatch** — the LLM's JSON response parses bare numeric IDs as `int64`, while the source dataframe's IDs are strings. Fixed by forcing both sides to string before merging.
-- **Partition column not reconstructed when reading a single partition folder directly** — pyarrow only infers Hive partition columns when reading from a recognized dataset root; pointing it at one partition folder as the root loses that column. Fixed by recovering the value from the input path when the column is absent.
-
-## Productionizing this
-
-Both AI components currently run locally against the deployed AWS resources (Athena, Glue, S3) the AWS-side pipeline is real, the AI layer's compute is the only piece still local. If this were moving toward production, here's the path:
-
-- **`day3_anomaly_triage.py` → AWS Lambda, triggered by an S3 event.** An `ObjectCreated` notification on the `day2-aggregates` prefix would invoke the triage automatically every time `day2_transform.py` writes a new partition, turning triage from something run manually into something that runs itself. The Anthropic API key would move from a local env var to AWS Secrets Manager, read at invocation time.
-- **`streamlit_app.py` → containerized on AWS App Runner.** A Dockerfile wrapping the existing app, pushed to Amazon ECR, deployed behind App Runner's managed HTTPS endpoint, no cluster to provision or manage for a single-container UI like this.
-- **Both** would move off long-lived local credentials and onto IAM roles scoped to exactly the actions each component needs (the same principle behind the IAM policy already in place for local runs), rather than a single broad user.
-
-Scoped out of this weekend build to stay within time constraints, but the design already anticipates it: neither script assumes a local execution context, and IAM permissions are already broken out by action rather than granted broadly.
+- **Triage on AWS Lambda:** triggered by an S3 event on each new partition, with the Anthropic API key in AWS Secrets Manager.
+- **Streamlit on AWS App Runner:** containerized and pushed to ECR, served at an HTTPS endpoint.
+- **Scoped IAM roles:** replace long-lived local credentials. Least privilege is `athena:StartQueryExecution`, `GetQueryExecution`, `StopQueryExecution`, `GetQueryResults`; `glue:GetTable`, `GetDatabase`, `GetPartitions`; and S3 get/put/list on the output bucket only.
 
 ## Files
 
-- `day1_smoke_test.py` — minimal read/count/write job used to validate the EMR Serverless + S3 plumbing before building real logic
-- `day2_transform.py` — the full transformation: schema handling, cleaning, feature engineering, aggregation, and partitioned write
-- `nl_to_sql.py` — natural-language → Athena SQL query layer (CLI)
-- `streamlit_app.py` — browser UI wrapper around `nl_to_sql.py`
-- `day3_anomaly_triage.py` — LLM-based triage of statistically flagged aggregate rows
+- `day1_smoke_test.py`: minimal read/count/write job to validate the EMR Serverless + S3 plumbing.
+- `day2_transform.py`: the full transformation (schema handling, cleaning, feature engineering, aggregation, partitioned write).
+- `nl_to_sql.py`: natural-language to Athena SQL, with the read-only safety check.
+- `streamlit_app.py`: Streamlit UI over `nl_to_sql.py`.
+- `day3_anomaly_triage.py`: statistical pre-filter plus Claude classification of flagged rows.
+- `docs/architecture.png`: the architecture diagram above.
+
+## Running it
+
+**EMR scripts** (`day1_smoke_test.py`, `day2_transform.py`) run on EMR Serverless as Spark jobs.
+
+**AI scripts** run locally:
+
+```bash
+pip3 install anthropic boto3 pandas pyarrow streamlit
+export ANTHROPIC_API_KEY="your-key"      # never commit this
+# AWS credentials configured (aws configure)
+
+# Natural-language querying
+python3 -m streamlit run streamlit_app.py
+
+# Anomaly triage (point --input at the day2-aggregates root, or a pickup_date=... folder)
+python3 day3_anomaly_triage.py \
+  --input s3://<your-bucket>/<output-prefix>/day2-aggregates/ \
+  --output triage_results.csv \
+  --sample-size 50
+```
 
 ## Tech stack
 
-AWS EMR Serverless · PySpark · Amazon S3 · AWS Glue · Amazon Athena · Anthropic Claude API · Streamlit
+AWS EMR Serverless · PySpark · Amazon S3 · AWS Glue · Amazon Athena · Anthropic Claude API · Streamlit · pandas / pyarrow
